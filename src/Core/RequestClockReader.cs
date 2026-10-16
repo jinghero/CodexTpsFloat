@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.Data.Sqlite;
 
 namespace CodexTpsFloat;
@@ -18,8 +19,9 @@ public sealed class RequestClockReader
     static readonly Regex TurnId = new("turn\\.id=\"?([\\w-]+)", RegexOptions.Compiled);
     public string? Warning { get; private set; }
     public RequestClockReader(string home) => this.home = home;
-    public IReadOnlyDictionary<string, double[]> Refresh()
+    public IReadOnlyDictionary<string, double[]> Refresh(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Warning = null;
         try
         {
@@ -42,6 +44,7 @@ public sealed class RequestClockReader
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 lastId = Math.Max(lastId, reader.GetInt64(0));
                 if (reader.IsDBNull(3) || reader.IsDBNull(4)) continue;
                 string body = reader.GetString(4);

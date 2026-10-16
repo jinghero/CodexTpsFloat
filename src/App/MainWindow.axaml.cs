@@ -4,10 +4,10 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
@@ -21,47 +21,61 @@ namespace CodexTpsFloat.App;
 public partial class MainWindow : Window
 {
     readonly DispatcherTimer timer = new();
-    readonly TrayIcon? tray;
+    readonly DesktopSession? session;
     readonly IAutostartService autostart = Autostart.Create();
     readonly SettingsStore settingsStore = OperatingSystem.IsWindows()
         ? SettingsStore.ForPortableApp(AppContext.BaseDirectory)
         : SettingsStore.ForUserProfile();
     readonly string? capturePath;
     PanelSettings settings;
-    UsageScanner scanner;
-    RequestClockReader requestClocks;
+    UsageScanner? scanner;
+    RequestClockReader? requestClocks;
     UsageSnapshot? snapshot;
+    CancellationTokenSource? refreshCancellation;
+    Task refreshTask = Task.CompletedTask;
+    DateTime lastSnapshotDate = BeijingNow.Date;
     bool refreshing, initialized, closing, positioned, refreshPending;
     readonly List<string> models = new() { "全部模型" };
 
     public MainWindow() : this(null, null) { }
 
     public MainWindow(string? capturePath = null, string? codexHome = null)
+        : this(capturePath, codexHome, null, null) { }
+
+    internal MainWindow(string? capturePath, string? codexHome, DesktopSession? session, PanelViewState? viewState)
     {
         this.capturePath = capturePath;
-        settings = settingsStore.Load();
-        if (codexHome != null) settings.CodexHome = Path.GetFullPath(codexHome);
+        this.session = session;
+        settings = viewState?.Settings ?? settingsStore.Load();
+        if (viewState == null && codexHome != null) settings.CodexHome = Path.GetFullPath(codexHome);
         settings.Normalize();
-        scanner = new(settings.CodexHome);
-        requestClocks = new(settings.CodexHome);
-
         InitializeComponent();
         InitializeState();
 
-        tray = OperatingSystem.IsBrowser() ? null : CreateTrayIcon();
-        HideButton.IsVisible = HasTray;
-        if (tray != null && Application.Current != null)
-            TrayIcon.SetIcons(Application.Current, new TrayIcons { tray });
+        HideButton.IsVisible = session?.HasTray == true;
+        if (viewState != null)
+        {
+            lastSnapshotDate = viewState.LastSnapshotDate;
+            DateBox.SelectedDate = viewState.Date;
+            if (!models.Contains(viewState.Model)) models.Add(viewState.Model);
+            ModelBox.SelectedItem = viewState.Model;
+            HistoryPanel.IsVisible = viewState.History;
+            HistoryButton.Content = viewState.History ? "分时统计  ⌄" : "今日分时  ›";
+            SettingsPanel.IsVisible = viewState.SettingsExpanded;
+        }
 
         Opened += (_, _) => PositionPanel();
         Closing += (_, _) => DisposeWindow();
+        PropertyChanged += VisibilityChanged;
     }
 
     static DateTimeOffset BeijingNow => DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(8));
 
-    // Linux can create the object without a status-notifier host. Keep the panel
-    // accessible until Avalonia exposes whether the host actually displays it.
-    public bool HasTray => tray != null && !OperatingSystem.IsLinux();
+    internal Task PendingRefresh => refreshTask;
+    internal Task RefreshNowAsync() => RefreshAsync();
+    internal PanelViewState RememberView() => new(settings, lastSnapshotDate,
+        DateBox.SelectedDate ?? BeijingNow.Date, ModelBox.SelectedItem as string ?? "全部模型",
+        HistoryPanel.IsVisible, SettingsPanel.IsVisible);
 
     void InitializeState()
     {
@@ -89,43 +103,11 @@ public partial class MainWindow : Window
         timer.Tick += async (_, _) => await RefreshAsync();
     }
 
-    TrayIcon? CreateTrayIcon()
-    {
-        try
-        {
-            var menu = new NativeMenu();
-            var open = new NativeMenuItem("打开统计面板");
-            open.Click += (_, _) => ShowPanel();
-            var refresh = new NativeMenuItem("立即刷新");
-            refresh.Click += async (_, _) => await RefreshAsync();
-            var exit = new NativeMenuItem("退出");
-            exit.Click += (_, _) => Close();
-            menu.Items.Add(open);
-            menu.Items.Add(refresh);
-            menu.Items.Add(exit);
-
-            var icon = new TrayIcon
-            {
-                Icon = TrayIconFactory.Create(),
-                ToolTipText = "Codex TPS 悬浮窗",
-                Menu = menu,
-                IsVisible = true
-            };
-            // Let AppKit tint the transparent glyph for light/dark menu bars.
-            MacOSProperties.SetIsTemplateIcon(icon, OperatingSystem.IsMacOS());
-            icon.Clicked += (_, _) => TogglePanel();
-            return icon;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
-
     public async Task StartAsync()
     {
         if (initialized) return;
         initialized = true;
+        if (!IsVisible) { SuspendMonitoring(); return; }
         timer.Start();
         await RefreshAsync();
     }
@@ -133,6 +115,7 @@ public partial class MainWindow : Window
     public async Task CaptureAndCloseAsync(string path)
     {
         ShowPanel();
+        await RefreshAsync();
         await Dispatcher.UIThread.InvokeAsync(() =>
         {
             Capture(path);
@@ -164,31 +147,58 @@ public partial class MainWindow : Window
         Activate();
     }
 
-    void TogglePanel()
+    async void VisibilityChanged(object? sender, AvaloniaPropertyChangedEventArgs change)
     {
-        if (IsVisible && HasTray) Hide();
-        else ShowPanel();
+        if (change.Property != IsVisibleProperty || !initialized || closing) return;
+        if (!IsVisible) { SuspendMonitoring(); return; }
+        timer.Start();
+        await RefreshAsync();
     }
 
-    async Task RefreshAsync()
+    void SuspendMonitoring()
     {
-        if (closing) return;
-        if (refreshing) { refreshPending = true; return; }
+        timer.Stop();
+        refreshPending = false;
+        refreshCancellation?.Cancel();
+        scanner = null;
+        requestClocks = null;
+        snapshot = null;
+        HourChart.Clear();
+        HeroValue.Text = "—";
+        StatusText.Text = "已暂停";
+        StatusDot.Fill = Brushes.Gray;
+        ToolTip.SetTip(StatusText, "缩回托盘后暂停统计，打开面板时重新读取日志。");
+        session?.SetToolTip("Codex TPS · 已暂停");
+    }
+
+    Task RefreshAsync()
+    {
+        if (closing || !IsVisible) return Task.CompletedTask;
+        if (refreshing) { refreshPending = true; return refreshTask; }
+        refreshTask = RefreshCoreAsync();
+        return refreshTask;
+    }
+
+    async Task RefreshCoreAsync()
+    {
         refreshing = true;
         RefreshButton.IsEnabled = false;
         StatusText.Text = "读取中";
+        using var cancellation = new CancellationTokenSource();
+        refreshCancellation = cancellation;
         try
         {
-            var activeScanner = scanner;
-            var activeClocks = requestClocks;
+            var activeScanner = scanner ??= new(settings.CodexHome);
+            var activeClocks = requestClocks ??= new(settings.CodexHome);
             var next = await Task.Run(() =>
             {
-                activeScanner.RequestStarts = activeClocks.Refresh();
-                return activeScanner.Refresh(BeijingNow);
-            });
-            if (closing || !ReferenceEquals(activeScanner, scanner)) return;
-            bool followToday = snapshot == null || DateBox.SelectedDate == snapshot.GeneratedAt.Date;
+                activeScanner.RequestStarts = activeClocks.Refresh(cancellation.Token);
+                return activeScanner.Refresh(BeijingNow, cancellation.Token);
+            }, cancellation.Token);
+            if (closing || !IsVisible || cancellation.IsCancellationRequested || !ReferenceEquals(activeScanner, scanner)) return;
+            bool followToday = DateBox.SelectedDate == lastSnapshotDate;
             snapshot = next;
+            lastSnapshotDate = next.GeneratedAt.Date;
             if (followToday) DateBox.SelectedDate = next.GeneratedAt.Date;
 
             string model = ModelBox.SelectedItem as string ?? "全部模型";
@@ -213,17 +223,20 @@ public partial class MainWindow : Window
                 $"{next.Files} 个文件；{next.InvalidLines} 条异常记录；{next.UnsupportedFiles} 个旧格式文件；{next.ReadFailures} 个读取失败。\nJSONL 扫描 {next.ScanMilliseconds:F0} 毫秒。" +
                 (activeClocks.Warning == null ? "" : "\n" + activeClocks.Warning));
         }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException)
         {
+            if (closing || !IsVisible || cancellation.IsCancellationRequested) return;
             StatusText.Text = "读取失败";
             StatusDot.Fill = Brushes.OrangeRed;
             ToolTip.SetTip(StatusText, e.Message);
         }
         finally
         {
+            if (ReferenceEquals(refreshCancellation, cancellation)) refreshCancellation = null;
             refreshing = false;
             RefreshButton.IsEnabled = true;
-            if (refreshPending && !closing)
+            if (refreshPending && !closing && IsVisible)
             {
                 refreshPending = false;
                 await RefreshAsync();
@@ -253,15 +266,15 @@ public partial class MainWindow : Window
         TtftValue.Text = m.TurnFirstTokenMs.HasValue
             ? $"轮次首字 {m.TurnFirstTokenMs.Value / 1000:F1} 秒"
             : "轮次首字 —";
-        if (tray != null) tray.ToolTipText = $"Codex TPS：{HeroValue.Text} 词元/秒（估算）";
+        session?.SetToolTip($"Codex TPS：{HeroValue.Text} 词元/秒（估算）");
         RenderHistory();
     }
 
     void RenderHistory()
     {
         if (snapshot == null || !IsVisible || !HistoryPanel.IsVisible) return;
-        HourGrid.ItemsSource = UsageScanner.Hours(
-            snapshot, (DateBox.SelectedDate ?? BeijingNow).Date, ModelFilter);
+        HourChart.SetHours(UsageScanner.Hours(
+            snapshot, (DateBox.SelectedDate ?? BeijingNow.Date).Date, ModelFilter));
     }
 
     void SaveSettings()
@@ -287,7 +300,8 @@ public partial class MainWindow : Window
         source.FindAncestorOfType<Button>(includeSelf: true) != null
         || source.FindAncestorOfType<TextBox>(includeSelf: true) != null
         || source.FindAncestorOfType<ComboBox>(includeSelf: true) != null
-        || source.FindAncestorOfType<DataGrid>(includeSelf: true) != null;
+        || source.FindAncestorOfType<CalendarDatePicker>(includeSelf: true) != null
+        || source.FindAncestorOfType<HourlyChart>(includeSelf: true) != null;
 
     async void RefreshClick(object? sender, RoutedEventArgs e) => await RefreshAsync();
 
@@ -325,10 +339,14 @@ public partial class MainWindow : Window
 
     void HideClick(object? sender, RoutedEventArgs e)
     {
-        if (HasTray) Hide();
+        if (session?.HasTray == true) session.HidePanel();
     }
 
-    void ExitClick(object? sender, RoutedEventArgs e) => Close();
+    void ExitClick(object? sender, RoutedEventArgs e)
+    {
+        if (session != null) session.Exit();
+        else Close();
+    }
 
     void WindowChanged(object? sender, RoutedEventArgs e)
     {
@@ -344,7 +362,7 @@ public partial class MainWindow : Window
         if (initialized) RenderMetrics();
     }
 
-    void DateChanged(object? sender, DatePickerSelectedValueChangedEventArgs e)
+    void DateChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (initialized) RenderHistory();
     }
@@ -378,6 +396,7 @@ public partial class MainWindow : Window
 
     void KeepOnScreen() => Dispatcher.UIThread.Post(() =>
     {
+        if (closing || !IsVisible) return;
         var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
         if (screen == null) return;
         double scale = screen.Scaling;
@@ -395,6 +414,7 @@ public partial class MainWindow : Window
             Title = "选择包含 sessions 的 Codex 数据目录",
             AllowMultiple = false
         });
+        if (closing) return;
         string? path = folders.FirstOrDefault()?.TryGetLocalPath();
         if (path == null) return;
         if (!Directory.Exists(Path.Combine(path, "sessions")))
@@ -404,8 +424,9 @@ public partial class MainWindow : Window
         }
         settings.CodexHome = path;
         HomeBox.Text = settings.CodexHome;
-        scanner = new(settings.CodexHome);
-        requestClocks = new(settings.CodexHome);
+        refreshCancellation?.Cancel();
+        scanner = null;
+        requestClocks = null;
         SaveSettings();
         await RefreshAsync();
     }
@@ -420,8 +441,9 @@ public partial class MainWindow : Window
 
     async void ExportClick(object? sender, RoutedEventArgs e)
     {
-        if (snapshot == null) return;
-        var date = (DateBox.SelectedDate ?? BeijingNow).Date;
+        var exportSnapshot = snapshot;
+        if (exportSnapshot == null) return;
+        var date = (DateBox.SelectedDate ?? BeijingNow.Date).Date;
         var markdownFileType = new FilePickerFileType("中文报告") { Patterns = new[] { "*.md" } };
         var jsonFileType = new FilePickerFileType("数据文件") { Patterns = new[] { "*.json" } };
         var result = await StorageProvider.SaveFilePickerWithResultAsync(new FilePickerSaveOptions
@@ -433,6 +455,7 @@ public partial class MainWindow : Window
             SuggestedFileType = markdownFileType,
             FileTypeChoices = new[] { markdownFileType, jsonFileType }
         });
+        if (closing) return;
         string? path = result.File?.TryGetLocalPath();
         if (path == null) return;
         string? selectedPattern = result.SelectedFileType?.Patterns?.FirstOrDefault();
@@ -445,8 +468,8 @@ public partial class MainWindow : Window
             var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             if (!string.Equals(path, targetPath, comparison) && File.Exists(targetPath)
                 && !await ShowMessage($"文件已存在：\n{targetPath}\n\n是否覆盖？", confirm: true)) return;
-            var hours = UsageScanner.Hours(snapshot, date, ModelFilter);
-            ReportExporter.Write(targetPath, snapshot, date, ModelFilter, hours);
+            var hours = UsageScanner.Hours(exportSnapshot, date, ModelFilter);
+            ReportExporter.Write(targetPath, exportSnapshot, date, ModelFilter, hours);
             _ = ShowMessage("报告已保存。");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -457,6 +480,7 @@ public partial class MainWindow : Window
 
     async Task<bool> ShowMessage(string message, bool confirm = false)
     {
+        if (!IsVisible) return false;
         var accept = new Button { Content = confirm ? "覆盖" : "确定", IsDefault = !confirm };
         var actions = new StackPanel
         {
@@ -511,7 +535,8 @@ public partial class MainWindow : Window
     {
         if (closing) return;
         closing = true;
-        timer.Stop();
+        SuspendMonitoring();
+        PropertyChanged -= VisibilityChanged;
         if (positioned && double.IsFinite(Position.X) && double.IsFinite(Position.Y))
         {
             double scale = Screens.ScreenFromWindow(this)?.Scaling ?? 1;
@@ -519,11 +544,11 @@ public partial class MainWindow : Window
             settings.Y = Position.Y / scale;
         }
         SaveSettings();
-        tray?.Dispose();
-        if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
-            desktop.Shutdown();
     }
 }
+
+internal sealed record PanelViewState(PanelSettings Settings, DateTime LastSnapshotDate,
+    DateTime Date, string Model, bool History, bool SettingsExpanded);
 
 static class TrayIconFactory
 {

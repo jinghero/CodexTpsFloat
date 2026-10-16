@@ -51,8 +51,20 @@ Near(stats.GenerationTps, 20, "生成速度按持续时间加权"); Near(stats.C
 Near(stats.RequestsPerMinute, 1, "完成请求计数"); Check(stats.ActiveSessions == 1, "活跃会话去重");
 Check(UsageScanner.Window(snap, 5).GenerationTps == null, "空窗口不能显示 0 生成速度");
 var hours = UsageScanner.Hours(snap, now.Date);
-Check(hours[0].Samples == 1 && hours[1].Samples == 0 && hours[1].Median == null, "北京时间小时与缺样本");
+Check(hours.Count == 1 && hours[0].Samples == 1, "北京时间零点后仅显示已经开始的小时");
 Near(hours[0].Median, 20, "小时中位数");
+var midday = snap with { GeneratedAt = new DateTimeOffset(now.Date.AddHours(12.5), TimeSpan.FromHours(8)) };
+var todayHours = UsageScanner.Hours(midday, now.Date);
+Check(todayHours.Count == 13 && todayHours[0].Hour == "12:00–13:00" && todayHours[^1].Hour == "00:00–01:00",
+    "今日分时隐藏未来小时并按时间倒排");
+Check(todayHours[0].Samples == 0 && todayHours[0].Median == null && todayHours[^1].Samples == 1,
+    "已发生但无样本的小时继续显示空值");
+var yesterdayHours = UsageScanner.Hours(midday, now.Date.AddDays(-1));
+Check(yesterdayHours.Count == 24 && yesterdayHours[0].Hour == "23:00–24:00" && yesterdayHours[^1].Hour == "00:00–01:00",
+    "历史日期显示完整一天并按时间倒排");
+Check(UsageScanner.Hours(midday, now.Date.AddDays(1)).Count == 0, "未来日期不显示未发生的小时");
+Check(UsageScanner.Hours(midday with { GeneratedAt = midday.GeneratedAt.ToUniversalTime() }, now.Date)
+    .Select(h => h.Hour).SequenceEqual(todayHours.Select(h => h.Hour)), "未来小时判断保持北京时间口径");
 
 var zero = new UsageScanner(".");
 zero.Ingest(Event("event_msg", new { type = "task_started", turn_id = "z" }, origin));
@@ -86,6 +98,16 @@ try
     File.AppendAllText(file, row[(row.Length / 2)..] + "\n", new UTF8Encoding(false));
     var initial = inc.Refresh(now);
     Check(initial.Records.Count == 1 && initial.InvalidLines == 0, "UTF8 BOM 与尾行补全");
+    using (var canceled = new CancellationTokenSource())
+    {
+        canceled.Cancel();
+        bool scanCanceled = false, clocksCanceled = false;
+        try { inc.Refresh(now, canceled.Token); }
+        catch (OperationCanceledException) { scanCanceled = true; }
+        try { new RequestClockReader(directory).Refresh(canceled.Token); }
+        catch (OperationCanceledException) { clocksCanceled = true; }
+        Check(scanCanceled && clocksCanceled, "扫描器和诊断库读取响应取消请求");
+    }
     Check(inc.Refresh(now).Records.Count == 1, "重复刷新不重复计数");
     File.Move(file, Path.Combine(directory, "archived_sessions", "test.jsonl"));
     Check(inc.Refresh(now).Records.Count == 1, "归档移动不重复计数");
@@ -138,7 +160,7 @@ try
     string streamRoot = Path.Combine(directory, "streaming");
     Directory.CreateDirectory(Path.Combine(streamRoot, "sessions"));
     string streamFile = Path.Combine(streamRoot, "sessions", "unicode.jsonl");
-    string longLine = "{\"type\":\"response_item\",\"payload\":{\"text\":\"" + new string('中', 70000) + "\"}}\r\n";
+    string longLine = "{\"type\":\"response_item\",\"payload\":{\"text\":\"" + new string('中', 1500000) + "\"}}\r\n";
     string unicodeRow = row.Replace("\"thread_id\":\"p\"", "\"thread_id\":\"中文线程\"");
     byte[] unicodeBytes = Encoding.UTF8.GetBytes(unicodeRow + "\r\n");
     int middleOfCharacter = Encoding.UTF8.GetByteCount(unicodeRow[..unicodeRow.IndexOf("中文线程", StringComparison.Ordinal)]) + 1;
@@ -156,6 +178,21 @@ try
     File.AppendAllText(streamFile, secondRow + "\n", new UTF8Encoding(false));
     Check(streamed.Refresh(now).Records.Count == 2 && streamed.Refresh(now).InvalidLines == 0,
         "长行后继续增量读取，CRLF 和 LF 不重复或遗漏记录");
+    File.AppendAllText(streamFile, longLine.TrimEnd('\r', '\n') + "junk\n", new UTF8Encoding(false));
+    Check(streamed.Refresh(now).InvalidLines == 1, "跳过大型非统计日志时仍校验完整 JSON，保留异常计数");
+
+    string lateType = row.Replace("\"type\":\"token_usage_record\",", "")[..^1]
+        + ",\"padding\":\"" + new string('x', 70000) + "\",\"type\":\"token_usage_record\"}";
+    var lateTypeScanner = new UsageScanner(directory);
+    lateTypeScanner.Ingest(lateType);
+    Check(lateTypeScanner.TimedRecords().Single().Usage.Id == "partial", "长记录的 type 在 payload 后面时仍计量");
+    lateTypeScanner.Ingest(lateType.Replace("\"type\":\"token_usage_record\"",
+        "\"type\":\"response_item\",\"type\":\"token_usage_record\""));
+    Check(lateTypeScanner.TimedRecords().Count == 1, "长记录按最后一个同名 type 属性计量且保持去重");
+    var ignoredTypeScanner = new UsageScanner(directory);
+    ignoredTypeScanner.Ingest(lateType.Replace("\"type\":\"token_usage_record\"",
+        "\"type\":\"token_usage_record\",\"type\":\"response_item\""));
+    Check(ignoredTypeScanner.TimedRecords().Count == 0, "长记录最后一个 type 不参与统计时忽略用量字段");
 
     string legacyRoot = Path.Combine(directory, "legacy");
     Directory.CreateDirectory(Path.Combine(legacyRoot, "sessions"));

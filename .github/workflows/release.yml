@@ -75,6 +75,10 @@ jobs:
         if: runner.os == 'Windows'
         run: dotnet run --project tests/TrayLifecycleTests.csproj -c Release --nologo -- --never-show
 
+      - name: Run Avalonia regression tests on Windows and macOS
+        if: runner.os != 'Linux'
+        run: dotnet run --project tests/AppTests.csproj -c Release --nologo
+
       - name: Build portable application
         if: runner.os == 'Windows'
         run: ./build.ps1 -Runtime ${{ matrix.runtime }} -Portable

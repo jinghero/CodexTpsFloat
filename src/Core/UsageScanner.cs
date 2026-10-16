@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace CodexTpsFloat;
 
@@ -34,6 +35,11 @@ public sealed record UsageSnapshot(DateTimeOffset GeneratedAt, IReadOnlyList<Tim
 
 public sealed class UsageScanner
 {
+    const int ReadBufferSize = 64 * 1024;
+    // Retain one normal buffer; unusually long JSONL lines must not leave large
+    // arrays cached in the shared pool after their file has been scanned.
+    static readonly ArrayPool<byte> ReadBuffers = ArrayPool<byte>.Create(ReadBufferSize, 1);
+
     sealed class Cursor
     {
         public const int TailCapacity = 256;
@@ -104,8 +110,33 @@ public sealed class UsageScanner
         var cursor = new Cursor { Thread = sourceThread };
         Parse(Encoding.UTF8.GetBytes(line), cursor);
     }
+    static bool IsTelemetryLine(ReadOnlySpan<byte> line)
+    {
+        var reader = new Utf8JsonReader(line);
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return true;
+        bool relevant = false;
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                reader.Read(); // Validate that no trailing JSON or garbage follows the object.
+                return relevant;
+            }
+            bool isType = reader.ValueTextEquals("type"u8);
+            reader.Read();
+            if (isType)
+                relevant = reader.TokenType == JsonTokenType.String
+                    && (reader.ValueTextEquals("session_meta"u8) || reader.ValueTextEquals("turn_context"u8)
+                        || reader.ValueTextEquals("event_msg"u8) || reader.ValueTextEquals("token_usage_record"u8));
+            reader.Skip();
+        }
+        return relevant;
+    }
     void Parse(ReadOnlyMemory<byte> line, Cursor cursor)
     {
+        // JsonDocument rents metadata buffers based on input size, even for ignored
+        // tool output. Validate large irrelevant lines without building a document.
+        if (line.Length >= ReadBufferSize && !IsTelemetryLine(line.Span)) return;
         using var doc = JsonDocument.Parse(line);
         var root = doc.RootElement;
         if (!root.TryGetProperty("payload", out var p) || p.ValueKind != JsonValueKind.Object) return;
@@ -169,19 +200,22 @@ public sealed class UsageScanner
         usage[responseId] = new(responseId, Str(p, "thread_id", cursor.Thread), turnId, timestamp,
             input, cached, outputCount, reasoning);
     }
-    void ReadCompleteLines(FileStream stream, Cursor cursor)
+    long ReadCompleteLines(FileStream stream, Cursor cursor, CancellationToken cancellationToken)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        byte[] buffer = ReadBuffers.Rent(ReadBufferSize);
         int buffered = 0;
+        long discardedBytes = 0;
         try
         {
             int read;
             while ((read = stream.Read(buffer, buffered, buffer.Length - buffered)) > 0)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 buffered += read;
                 int consumed = 0;
                 while (consumed < buffered)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     int newline = buffer.AsSpan(consumed, buffered - consumed).IndexOf((byte)'\n');
                     if (newline < 0) break;
                     var line = buffer.AsMemory(consumed, newline);
@@ -199,15 +233,22 @@ public sealed class UsageScanner
                 if (buffered > 0 && consumed > 0) Buffer.BlockCopy(buffer, consumed, buffer, 0, buffered);
                 if (buffered == buffer.Length)
                 {
-                    byte[] larger = ArrayPool<byte>.Shared.Rent(checked(buffer.Length * 2));
+                    byte[] larger = ReadBuffers.Rent(checked(buffer.Length * 2));
                     Buffer.BlockCopy(buffer, 0, larger, 0, buffered);
-                    ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+                    ReturnBuffer(buffer);
                     buffer = larger;
                 }
             }
             // Leave an unfinished tail at its original offset for the next refresh.
         }
-        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+        finally { ReturnBuffer(buffer); }
+        return discardedBytes;
+
+        void ReturnBuffer(byte[] returned)
+        {
+            if (returned.Length > ReadBufferSize) discardedBytes += returned.Length;
+            ReadBuffers.Return(returned, clearArray: true);
+        }
     }
     static bool BytesMatch(FileStream stream, long offset, ReadOnlySpan<byte> expected)
     {
@@ -228,11 +269,13 @@ public sealed class UsageScanner
         cursor.Prefix != null && cursor.Tail != null && stream.Length >= cursor.Offset
         && BytesMatch(stream, 0, cursor.Prefix.AsSpan(0, cursor.PrefixLength))
         && BytesMatch(stream, cursor.Offset - cursor.TailLength, cursor.Tail.AsSpan(0, cursor.TailLength));
-    public UsageSnapshot Refresh(DateTimeOffset now)
+    public UsageSnapshot Refresh(DateTimeOffset now, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var watch = System.Diagnostics.Stopwatch.StartNew();
         var files = new List<string>();
         int failures = 0;
+        long discardedBufferBytes = 0;
         foreach (string directory in new[] { Path.Combine(home, "sessions"), Path.Combine(home, "archived_sessions") })
         {
             if (!Directory.Exists(directory)) continue;
@@ -241,6 +284,7 @@ public sealed class UsageScanner
         }
         foreach (var path in files)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 if (!cursors.TryGetValue(path, out var cursor)) cursors[path] = cursor = new();
@@ -267,31 +311,37 @@ public sealed class UsageScanner
                 {
                     // Rebuild after replacement/truncation; stale usage must not survive a reset.
                     cursors.Clear(); usage.Clear(); turns.Clear(); invalidLines = 0;
-                    return Refresh(now);
+                    return Refresh(now, cancellationToken);
                 }
                 cursor.Creation = creation;
                 cursor.LastLength = length;
                 if (stream.Length == cursor.Offset) continue;
                 stream.Seek(cursor.Offset, SeekOrigin.Begin);
-                ReadCompleteLines(stream, cursor);
+                discardedBufferBytes += ReadCompleteLines(stream, cursor, cancellationToken);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { failures++; }
         }
-        var records = TimedRecords(now.ToUnixTimeMilliseconds() / 1000d);
+        cancellationToken.ThrowIfCancellationRequested();
+        var records = TimedRecords(now.ToUnixTimeMilliseconds() / 1000d, cancellationToken);
         watch.Stop();
         var frozenTurns = turns.ToDictionary(pair => pair.Key, pair => new TurnData
         {
             Start = pair.Value.Start, Model = pair.Value.Model,
             FirstTokenMs = pair.Value.FirstTokenMs, Completed = pair.Value.Completed
         });
+        // A bulk scan can discard many large arrays without further LOH allocations
+        // to trigger their collection. Reclaim them in the background after that scan.
+        if (discardedBufferBytes >= 8 * 1024 * 1024)
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: false);
         return new(now, records, frozenTurns, files.Count, invalidLines,
             cursors.Values.Count(c => c.HasLegacyUsage && !c.HasUsage), failures, watch.Elapsed.TotalMilliseconds);
     }
-    public IReadOnlyList<TimedUsage> TimedRecords(double cutoff = double.PositiveInfinity)
+    public IReadOnlyList<TimedUsage> TimedRecords(double cutoff = double.PositiveInfinity, CancellationToken cancellationToken = default)
     {
         var result = new List<TimedUsage>();
         foreach (var group in usage.Values.Where(r => r.Completed <= cutoff).GroupBy(r => r.Turn))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             turns.TryGetValue(group.Key, out var turn);
             double previous = turn?.Start ?? double.NegativeInfinity;
             foreach (var r in group.OrderBy(r => r.Completed))
@@ -352,7 +402,8 @@ public sealed class UsageScanner
         var start = new DateTimeOffset(date.Date, tz).ToUnixTimeSeconds();
         var rows = snapshot.Records.Where(r => r.StreamStart >= start && r.StreamStart < start + 86400
             && r.StreamSeconds is > 0 && (model == null || r.Model == model)).ToArray();
-        return Enumerable.Range(0, 24).Select(hour =>
+        long asOf = snapshot.GeneratedAt.ToUnixTimeSeconds();
+        return Enumerable.Range(0, 24).Where(hour => start + hour * 3600 <= asOf).Reverse().Select(hour =>
         {
             var a = rows.Where(r => DateTimeOffset.FromUnixTimeMilliseconds((long)(r.StreamStart!.Value * 1000))
                 .ToOffset(tz).Hour == hour).ToArray();

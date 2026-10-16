@@ -24,7 +24,7 @@ public partial class App : Application
         if (!show.Wait(TimeSpan.FromSeconds(2)))
             throw new TimeoutException("统计面板未响应显示请求，请稍后重试。");
     }
-    MainWindow? window;
+    DesktopSession? session;
 
     public override void Initialize() => AvaloniaXamlLoader.Load(this);
 
@@ -37,20 +37,15 @@ public partial class App : Application
         }
 
         desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
-        window = new MainWindow(Options.CapturePath, Options.CodexHome);
+        session = new DesktopSession(() => desktop.Shutdown(), Options.CapturePath, Options.CodexHome);
 
         desktop.Startup += async (_, _) =>
         {
-            await window.StartAsync();
+            await session.StartAsync();
             if (Options.CapturePath == null)
-                panelReady.TrySetResult(window.ShowPanel);
-            if (Options.CapturePath != null)
-                await window.CaptureAndCloseAsync(Options.CapturePath);
-            // Avalonia can create a tray icon on macOS without macOS displaying it,
-            // so there is no reliable way to detect an unusable menu bar item.
-            else if (OperatingSystem.IsMacOS() || !window.HasTray)
-                window.ShowPanel();
+                panelReady.TrySetResult(session.ShowPanel);
         };
+        desktop.Exit += (_, _) => session.Exit();
 
         base.OnFrameworkInitializationCompleted();
     }

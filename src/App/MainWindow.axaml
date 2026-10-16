@@ -1,6 +1,6 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:core="using:CodexTpsFloat"
+        xmlns:app="using:CodexTpsFloat.App"
         x:Class="CodexTpsFloat.App.MainWindow"
         Title="Codex TPS 悬浮窗"
         Width="432"
@@ -68,6 +68,25 @@
     </Style>
     <Style Selector="Button:disabled">
       <Setter Property="Opacity" Value="0.45"/>
+    </Style>
+    <Style Selector="CalendarDatePicker#DateBox /template/ Button#PART_Button">
+      <Setter Property="Width" Value="30"/>
+      <Setter Property="Margin" Value="0,2,2,2"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Border x:Name="CalendarButtonBackground" Background="{TemplateBinding Background}" CornerRadius="4">
+            <Path Width="16" Height="16" Stretch="Uniform"
+                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                  Stroke="{TemplateBinding Foreground}"
+                  StrokeThickness="1.8" StrokeLineCap="Round" StrokeJoin="Round"
+                  Data="M7 2v4 M17 2v4 M3 10h18 M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/>
+          </Border>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="CalendarDatePicker#DateBox /template/ Button#PART_Button:pointerover /template/ Border#CalendarButtonBackground">
+      <Setter Property="Background" Value="#E9E9EF"/>
     </Style>
     <Style Selector="RadioButton.segment">
       <Setter Property="Theme" Value="{StaticResource WindowSegment}"/>
@@ -233,21 +252,26 @@
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
-          <DatePicker x:Name="DateBox" SelectedDateChanged="DateChanged" Width="138" HorizontalAlignment="Left"/>
-          <Button Grid.Column="1" Content="导出报告" Click="ExportClick" Foreground="#007AFF"/>
+          <CalendarDatePicker x:Name="DateBox" SelectedDateChanged="DateChanged"
+                              SelectedDateFormat="Custom" CustomDateFormatString="yyyy-MM-dd"
+                              Width="154" MinWidth="0" Height="30" MinHeight="0"
+                              FontSize="12" Padding="8,0" CornerRadius="6"
+                              Background="#F7F7F9" BorderBrush="#DFDFE4"
+                              HorizontalAlignment="Left" VerticalContentAlignment="Center"/>
+          <Button Grid.Column="1" Content="导出报告" Click="ExportClick" Foreground="#007AFF" VerticalAlignment="Center"/>
         </Grid>
-        <DataGrid x:Name="HourGrid" x:DataType="core:HourStats" Height="216" IsReadOnly="True" AutoGenerateColumns="False"
-                  HeadersVisibility="Column" GridLinesVisibility="Horizontal"
-                  HorizontalGridLinesBrush="#EEEEF2" BorderThickness="0" RowHeight="26" FontSize="11"
-                  Background="White">
-          <DataGrid.Columns>
-            <DataGridTextColumn Header="北京时间" Binding="{CompiledBinding Hour}" Width="*"/>
-            <DataGridTextColumn Header="样本" Binding="{CompiledBinding Samples}" Width="45"/>
-            <DataGridTextColumn Header="中位数" Binding="{CompiledBinding Median, StringFormat=F1, TargetNullValue=—}" Width="59"/>
-            <DataGridTextColumn Header="加权 TPS" Binding="{CompiledBinding Weighted, StringFormat=F1, TargetNullValue=—}" Width="66"/>
-          </DataGrid.Columns>
-        </DataGrid>
-        <TextBlock Text="无样本显示 —；按首个输出项小时分组" Classes="muted" Margin="0,6,0,0"/>
+        <StackPanel Orientation="Horizontal" Spacing="14" Margin="0,3,0,0">
+          <StackPanel Orientation="Horizontal" Spacing="5">
+            <Rectangle Width="16" Height="2" Fill="#007AFF"/>
+            <TextBlock Text="加权 TPS" Classes="muted"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Spacing="5">
+            <Line Width="16" Height="2" StartPoint="0,1" EndPoint="16,1" Stroke="#AF52DE" StrokeThickness="2" StrokeDashArray="4,3"/>
+            <TextBlock Text="中位数" Classes="muted"/>
+          </StackPanel>
+        </StackPanel>
+        <app:HourlyChart x:Name="HourChart" Height="216"/>
+        <TextBlock Text="北京时间 · 悬停查看详情 · 无样本时断线" Classes="muted" Margin="0,6,0,0"/>
       </StackPanel>
 
       <StackPanel x:Name="SettingsPanel" IsVisible="False" Margin="18,0,18,12">
