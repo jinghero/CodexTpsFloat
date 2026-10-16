@@ -11,6 +11,41 @@ using CodexTpsFloat.App;
 using AppWindow = CodexTpsFloat.App.MainWindow;
 using Path = System.IO.Path;
 
+if (args is [var childMode, var childHome, var childSettings]
+    && childMode is "--framework-shutdown" or "--window-exit")
+{
+    int exitEvents = 0;
+    bool shutdownAccepted = false;
+    CodexTpsFloat.App.App.Options = new(null, childHome, null);
+    AppBuilder.Configure<CodexTpsFloat.App.App>().UseSkia()
+        .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
+        .WithInterFont().StartWithClassicDesktopLifetime(Array.Empty<string>(), desktop =>
+        {
+            desktop.Exit += (_, _) => exitEvents++;
+            desktop.Startup += (_, _) => Dispatcher.UIThread.Post(() =>
+            {
+                const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
+                var appSession = (DesktopSession)typeof(CodexTpsFloat.App.App)
+                    .GetField("session", fields)!.GetValue(Application.Current)!;
+                if (childMode == "--window-exit") appSession.ShowPanel();
+                if (typeof(DesktopSession).GetField("window", fields)!.GetValue(appSession) is AppWindow panel)
+                {
+                    typeof(AppWindow).GetField("settingsStore", fields)!.SetValue(panel, new SettingsStore(childSettings));
+                    if (childMode == "--window-exit")
+                    {
+                        panel.Close();
+                        shutdownAccepted = true;
+                    }
+                }
+                if (childMode == "--framework-shutdown") shutdownAccepted = desktop.TryShutdown();
+            });
+        });
+    if (!shutdownAccepted || exitEvents != 1)
+        throw new Exception($"Framework shutdown was reentered: accepted={shutdownAccepted}, exitEvents={exitEvents}");
+    Console.WriteLine($"PASS the real desktop lifetime handles {childMode} exactly once");
+    return;
+}
+
 AppBuilder.Configure<CodexTpsFloat.App.App>().UseSkia()
     .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).WithInterFont().SetupWithoutStarting();
 string root = Path.Combine(Path.GetTempPath(), "codex-export-regression-" + Guid.NewGuid().ToString("N"));
@@ -302,6 +337,15 @@ closingPanel.Close();
 closeSession.ShowPanel();
 Check(shutdowns == beforeClose + 1 && Panel(closeSession) == null && closingPanel.PlatformImpl == null,
     "closing the statistics window exits once and cannot reopen a terminated session");
+var disposingSession = new DesktopSession(() => shutdowns++, capturePath: "test", codexHome: fixtureHome);
+disposingSession.ShowPanel();
+var disposingPanel = Panel(disposingSession)!;
+Complete((Task)Field(disposingPanel, "refreshTask")!);
+int beforeDispose = shutdowns;
+disposingSession.Dispose();
+disposingSession.Exit();
+Check(shutdowns == beforeDispose && Panel(disposingSession) == null && disposingPanel.PlatformImpl == null,
+    "framework cleanup disposes the window and tray without requesting another shutdown");
 int platformShutdowns = 0;
 var platformSession = new DesktopSession(() => platformShutdowns++, codexHome: fixtureHome);
 Complete(platformSession.StartAsync());
@@ -317,6 +361,22 @@ if (Panel(platformSession) is { } platformPanel)
 }
 platformSession.Exit();
 Check(platformShutdowns == 1, "normal platform startup can exit without leaving a window running");
+foreach (string mode in new[] { "--framework-shutdown", "--window-exit" })
+{
+    using var child = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = Environment.ProcessPath!,
+        UseShellExecute = false,
+        ArgumentList = { mode, fixtureHome, Path.Combine(root, "framework-settings.json") }
+    }) ?? throw new Exception("Could not start the framework lifecycle test");
+    if (!child.WaitForExit(10000))
+    {
+        child.Kill(true);
+        child.WaitForExit();
+        throw new Exception("Framework shutdown timed out");
+    }
+    Check(child.ExitCode == 0, $"{mode} completes without reentering the application exit event");
+}
 Console.WriteLine($"All {passed} Avalonia regression checks passed without native UI.");
 
 public class TestProxy : DispatchProxy

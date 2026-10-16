@@ -9,7 +9,7 @@ namespace CodexTpsFloat.App;
 
 // The tray outlives each statistics window. Keeping a hidden Window would also
 // retain its native handle, composition target and control tree.
-public sealed class DesktopSession
+public sealed class DesktopSession : IDisposable
 {
     readonly Action shutdown;
     readonly string? capturePath, codexHome;
@@ -105,6 +105,13 @@ public sealed class DesktopSession
     public void Exit()
     {
         if (exiting) return;
+        Dispose();
+        shutdown();
+    }
+
+    public void Dispose()
+    {
+        if (exiting) return;
         exiting = true;
         var panel = window;
         window = null;
@@ -112,7 +119,6 @@ public sealed class DesktopSession
         tray?.Dispose();
         if (Application.Current != null)
             TrayIcon.SetIcons(Application.Current, new TrayIcons());
-        shutdown();
     }
 
     internal void SetToolTip(string text)

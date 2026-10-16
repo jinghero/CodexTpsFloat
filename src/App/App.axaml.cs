@@ -45,7 +45,8 @@ public partial class App : Application
             if (Options.CapturePath == null)
                 panelReady.TrySetResult(session.ShowPanel);
         };
-        desktop.Exit += (_, _) => session.Exit();
+        desktop.ShutdownRequested += (_, _) => session.Dispose();
+        desktop.Exit += (_, _) => session.Dispose();
 
         base.OnFrameworkInitializationCompleted();
     }
