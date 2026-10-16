@@ -279,7 +279,14 @@ public sealed class UsageScanner
         foreach (string directory in new[] { Path.Combine(home, "sessions"), Path.Combine(home, "archived_sessions") })
         {
             if (!Directory.Exists(directory)) continue;
-            try { files.AddRange(Directory.EnumerateFiles(directory, "*.jsonl", SearchOption.AllDirectories)); }
+            try
+            {
+                foreach (string path in Directory.EnumerateFiles(directory, "*.jsonl", SearchOption.AllDirectories))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    files.Add(path);
+                }
+            }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { failures++; }
         }
         foreach (var path in files)
@@ -403,7 +410,7 @@ public sealed class UsageScanner
         var rows = snapshot.Records.Where(r => r.StreamStart >= start && r.StreamStart < start + 86400
             && r.StreamSeconds is > 0 && (model == null || r.Model == model)).ToArray();
         long asOf = snapshot.GeneratedAt.ToUnixTimeSeconds();
-        return Enumerable.Range(0, 24).Where(hour => start + hour * 3600 <= asOf).Reverse().Select(hour =>
+        return Enumerable.Range(0, 24).Where(hour => start + hour * 3600 <= asOf).Select(hour =>
         {
             var a = rows.Where(r => DateTimeOffset.FromUnixTimeMilliseconds((long)(r.StreamStart!.Value * 1000))
                 .ToOffset(tz).Hour == hour).ToArray();

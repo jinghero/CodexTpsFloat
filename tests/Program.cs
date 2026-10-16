@@ -55,13 +55,13 @@ Check(hours.Count == 1 && hours[0].Samples == 1, "北京时间零点后仅显示
 Near(hours[0].Median, 20, "小时中位数");
 var midday = snap with { GeneratedAt = new DateTimeOffset(now.Date.AddHours(12.5), TimeSpan.FromHours(8)) };
 var todayHours = UsageScanner.Hours(midday, now.Date);
-Check(todayHours.Count == 13 && todayHours[0].Hour == "12:00–13:00" && todayHours[^1].Hour == "00:00–01:00",
-    "今日分时隐藏未来小时并按时间倒排");
-Check(todayHours[0].Samples == 0 && todayHours[0].Median == null && todayHours[^1].Samples == 1,
+Check(todayHours.Count == 13 && todayHours[0].Hour == "00:00–01:00" && todayHours[^1].Hour == "12:00–13:00",
+    "今日分时隐藏未来小时并按时间正序排列");
+Check(todayHours[0].Samples == 1 && todayHours[^1].Median == null && todayHours[^1].Samples == 0,
     "已发生但无样本的小时继续显示空值");
 var yesterdayHours = UsageScanner.Hours(midday, now.Date.AddDays(-1));
-Check(yesterdayHours.Count == 24 && yesterdayHours[0].Hour == "23:00–24:00" && yesterdayHours[^1].Hour == "00:00–01:00",
-    "历史日期显示完整一天并按时间倒排");
+Check(yesterdayHours.Count == 24 && yesterdayHours[0].Hour == "00:00–01:00" && yesterdayHours[^1].Hour == "23:00–24:00",
+    "历史日期显示完整一天并按时间正序排列");
 Check(UsageScanner.Hours(midday, now.Date.AddDays(1)).Count == 0, "未来日期不显示未发生的小时");
 Check(UsageScanner.Hours(midday with { GeneratedAt = midday.GeneratedAt.ToUniversalTime() }, now.Date)
     .Select(h => h.Hour).SequenceEqual(todayHours.Select(h => h.Hour)), "未来小时判断保持北京时间口径");
@@ -180,6 +180,97 @@ try
         "长行后继续增量读取，CRLF 和 LF 不重复或遗漏记录");
     File.AppendAllText(streamFile, longLine.TrimEnd('\r', '\n') + "junk\n", new UTF8Encoding(false));
     Check(streamed.Refresh(now).InvalidLines == 1, "跳过大型非统计日志时仍校验完整 JSON，保留异常计数");
+    string fullLargeObject = longLine.TrimEnd('\r', '\n');
+    File.AppendAllText(streamFile, fullLargeObject[..^1] + "\n" + fullLargeObject[..^4] + "\n", new UTF8Encoding(false));
+    Check(streamed.Refresh(now).InvalidLines == 3,
+        "大型无关记录缺少根结束符或截断字符串仍计入坏记录");
+
+    string cancelHome = Path.Combine(directory, "cancel-scan");
+    Directory.CreateDirectory(Path.Combine(cancelHome, "sessions"));
+    using (var writer = new StreamWriter(Path.Combine(cancelHome, "sessions", "slow.jsonl")))
+    {
+        writer.WriteLine("bad-json"); // A visible progress marker before the expensive input.
+        for (int i = 0; i < 16; i++) writer.Write(longLine);
+        writer.WriteLine(row);
+    }
+    var midScan = new UsageScanner(cancelHome);
+    var invalidField = typeof(UsageScanner).GetField("invalidLines", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+    using (var cancellation = new CancellationTokenSource())
+    {
+        var scan = Task.Run(() => midScan.Refresh(now, cancellation.Token));
+        try
+        {
+            Check(SpinWait.SpinUntil(() => (int)invalidField.GetValue(midScan)! > 0 || scan.IsCompleted, 5000)
+                && !scan.IsCompleted, "日志扫描实际处理了首行后才发出取消请求");
+            cancellation.Cancel();
+            bool canceled = false;
+            try { scan.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult(); }
+            catch (OperationCanceledException) { canceled = true; }
+            Check(canceled && midScan.TimedRecords().Count == 0, "中途取消在处理文件尾部用量前停止扫描");
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { scan.GetAwaiter().GetResult(); } catch (OperationCanceledException) { }
+        }
+    }
+
+    string clockHome = Path.Combine(directory, "cancel-clocks");
+    Directory.CreateDirectory(clockHome);
+    using (var database = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+        { DataSource = Path.Combine(clockHome, "logs_1.sqlite"), Pooling = false }.ToString()))
+    {
+        database.Open();
+        using var seed = database.CreateCommand();
+        seed.CommandText = """
+            CREATE TABLE seed (id INTEGER PRIMARY KEY);
+            WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<5000)
+                INSERT INTO seed SELECT id FROM n;
+            CREATE VIEW logs AS SELECT a.id*5000+b.id AS id, 100 AS ts, 0 AS ts_nanos,
+                'thread' AS thread_id, 'other' AS target, '' AS feedback_log_body FROM seed a CROSS JOIN seed b;
+            """;
+        seed.ExecuteNonQuery();
+        SQLitePCL.raw.sqlite3_busy_timeout(database.Handle, 0);
+        using var cancellation = new CancellationTokenSource();
+        var clocks = Task.Run(() => new RequestClockReader(clockHome).Refresh(cancellation.Token));
+        try
+        {
+            bool reading = false;
+            Check(SpinWait.SpinUntil(() =>
+            {
+                int result = SQLitePCL.raw.sqlite3_exec(database.Handle, "BEGIN EXCLUSIVE");
+                if (result == SQLitePCL.raw.SQLITE_BUSY) reading = true;
+                else
+                {
+                    Check(result == SQLitePCL.raw.SQLITE_OK, "检查诊断读取的共享锁");
+                    SQLitePCL.raw.sqlite3_exec(database.Handle, "ROLLBACK");
+                }
+                return reading || clocks.IsCompleted;
+            }, 5000) && reading && !clocks.IsCompleted, "诊断查询持有读取锁后才发出取消请求");
+            cancellation.Cancel();
+            bool canceled = false;
+            try { clocks.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult(); }
+            catch (OperationCanceledException) { canceled = true; }
+            Check(canceled, "没有返回首行的诊断查询可中断，取消不会被降级告警吞掉");
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { clocks.GetAwaiter().GetResult(); } catch (OperationCanceledException) { }
+        }
+        seed.CommandText = """
+            DROP VIEW logs;
+            CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER,
+                thread_id TEXT, target TEXT, feedback_log_body TEXT);
+            INSERT INTO logs VALUES (1,100,250000000,'clock-thread','feedback_tags',
+                'run_sampling_request{turn.id="clock-turn"} endpoint="/responses"');
+            """;
+        seed.ExecuteNonQuery();
+        var normalClocks = new RequestClockReader(clockHome);
+        Check(normalClocks.Refresh()["clock-thread/clock-turn"].Single() == 100.25 && normalClocks.Warning == null
+            && normalClocks.Refresh()["clock-thread/clock-turn"].Length == 1,
+            "正常诊断查询保持时钟精度、增量去重和无降级状态");
+    }
 
     string lateType = row.Replace("\"type\":\"token_usage_record\",", "")[..^1]
         + ",\"padding\":\"" + new string('x', 70000) + "\",\"type\":\"token_usage_record\"}";

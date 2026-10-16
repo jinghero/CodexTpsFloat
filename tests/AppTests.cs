@@ -149,9 +149,9 @@ Check(File.ReadAllText(target).TrimStart('\uFEFF').StartsWith("{") && !File.Exis
 using (var exported = System.Text.Json.JsonDocument.Parse(File.ReadAllText(target)))
 {
     var exportedHours = exported.RootElement.GetProperty("hours");
-    Check(exportedHours.GetArrayLength() == 13 && exportedHours[0].GetProperty("Hour").GetString() == "12:00–13:00"
-        && exportedHours[12].GetProperty("Hour").GetString() == "00:00–01:00",
-        "exported history retains elapsed hours in descending order");
+    Check(exportedHours.GetArrayLength() == 13 && exportedHours[0].GetProperty("Hour").GetString() == "00:00–01:00"
+        && exportedHours[12].GetProperty("Hour").GetString() == "12:00–13:00",
+        "exported history retains elapsed hours in chronological order");
 }
 Click(window.OwnedWindows.Single(), "确定");
 File.Delete(target);
@@ -280,6 +280,8 @@ Check(Panel(session) == null && firstPanel.PlatformImpl == null
     && !((DispatcherTimer)Field(firstPanel, "timer")!).IsEnabled
     && Field(firstPanel, "snapshot") == null && shutdowns == 0,
     "returning to the tray destroys the native window and cancels monitoring without exiting");
+string parkedLog = Path.Combine(root, "parked-session.jsonl");
+File.Move(fixturePath, parkedLog);
 session.ShowPanel();
 var rebuiltPanel = Panel(session)!;
 Check(!ReferenceEquals(firstPanel, rebuiltPanel) && rebuiltPanel.IsVisible
@@ -289,8 +291,14 @@ Check(!ReferenceEquals(firstPanel, rebuiltPanel) && rebuiltPanel.IsVisible
     && rebuiltPanel.FindControl<StackPanel>("SettingsPanel")!.IsVisible,
     "opening creates a fresh window and restores the selected date, model and expanded sections");
 Complete((Task)Field(rebuiltPanel, "refreshTask")!);
-Check(((UsageSnapshot)Field(rebuiltPanel, "snapshot")!).Records.Count == 2,
-    "the rebuilt window reads statistics from the existing logs");
+Check(((UsageSnapshot)Field(rebuiltPanel, "snapshot")!).Records.Count == 0
+    && (string?)rebuiltPanel.FindControl<ComboBox>("ModelBox")!.SelectedItem == "未知模型",
+    "a temporary scan with no model records preserves the remembered filter");
+File.Move(parkedLog, fixturePath);
+Complete(Refresh(rebuiltPanel));
+Check(((UsageSnapshot)Field(rebuiltPanel, "snapshot")!).Records.Count == 2
+    && (string?)rebuiltPanel.FindControl<ComboBox>("ModelBox")!.SelectedItem == "未知模型",
+    "the rebuilt window reads reappearing logs without losing the selected model");
 var closingScan = Refresh(rebuiltPanel);
 session.HidePanel();
 session.ShowPanel();
@@ -361,6 +369,35 @@ if (Panel(platformSession) is { } platformPanel)
 }
 platformSession.Exit();
 Check(platformShutdowns == 1, "normal platform startup can exit without leaving a window running");
+using (var startedRead = new ManualResetEventSlim())
+using (var finishRead = new ManualResetEventSlim())
+using (var readFinished = new ManualResetEventSlim())
+using (var cancellation = new CancellationTokenSource())
+{
+    Func<UsageSnapshot> blockedRead = () =>
+    {
+        startedRead.Set();
+        finishRead.Wait();
+        readFinished.Set();
+        throw new IOException("late fixture failure");
+    };
+    var work = (Task<UsageSnapshot>)typeof(AppWindow).GetMethod("RunScanAsync", BindingFlags.Static | BindingFlags.NonPublic)!
+        .Invoke(null, new object[] { blockedRead, cancellation.Token })!;
+    try
+    {
+        Check(startedRead.Wait(5000), "the blocking read fixture has started before cancellation");
+        cancellation.Cancel();
+        bool canceled = false;
+        try { Complete(work); } catch (OperationCanceledException) { canceled = true; }
+        Check(canceled && !readFinished.IsSet,
+            "canceling detaches the window wait even while an operating-system read remains blocked");
+    }
+    finally
+    {
+        finishRead.Set();
+        if (!readFinished.Wait(5000)) throw new Exception("Blocked read fixture did not finish");
+    }
+}
 foreach (string mode in new[] { "--framework-shutdown", "--window-exit" })
 {
     using var child = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo

@@ -186,15 +186,16 @@ public partial class MainWindow : Window
         StatusText.Text = "读取中";
         using var cancellation = new CancellationTokenSource();
         refreshCancellation = cancellation;
+        var token = cancellation.Token;
         try
         {
             var activeScanner = scanner ??= new(settings.CodexHome);
             var activeClocks = requestClocks ??= new(settings.CodexHome);
-            var next = await Task.Run(() =>
+            var next = await RunScanAsync(() =>
             {
-                activeScanner.RequestStarts = activeClocks.Refresh(cancellation.Token);
-                return activeScanner.Refresh(BeijingNow, cancellation.Token);
-            }, cancellation.Token);
+                activeScanner.RequestStarts = activeClocks.Refresh(token);
+                return activeScanner.Refresh(BeijingNow, token);
+            }, token);
             if (closing || !IsVisible || cancellation.IsCancellationRequested || !ReferenceEquals(activeScanner, scanner)) return;
             bool followToday = DateBox.SelectedDate == lastSnapshotDate;
             snapshot = next;
@@ -202,14 +203,15 @@ public partial class MainWindow : Window
             if (followToday) DateBox.SelectedDate = next.GeneratedAt.Date;
 
             string model = ModelBox.SelectedItem as string ?? "全部模型";
-            var nextModels = new[] { "全部模型" }.Concat(next.Records.Select(r => r.Model).Distinct().Order()).ToList();
+            var nextModels = new[] { "全部模型" }.Concat(next.Records.Select(r => r.Model).Append(model)
+                .Where(value => value != "全部模型").Distinct().Order()).ToList();
             if (!models.SequenceEqual(nextModels))
             {
                 models.Clear();
                 models.AddRange(nextModels);
                 ModelBox.ItemsSource = null;
                 ModelBox.ItemsSource = models;
-                ModelBox.SelectedItem = models.Contains(model) ? model : "全部模型";
+                ModelBox.SelectedItem = model;
             }
 
             RenderMetrics();
@@ -241,6 +243,20 @@ public partial class MainWindow : Window
                 refreshPending = false;
                 await RefreshAsync();
             }
+        }
+    }
+
+    static async Task<UsageSnapshot> RunScanAsync(Func<UsageSnapshot> read, CancellationToken token)
+    {
+        var work = Task.Run(read, token);
+        try { return await work.WaitAsync(token); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            // A filesystem call may still be blocked in the OS. Stop the window's
+            // await immediately, and observe any later failure of that worker.
+            _ = work.ContinueWith(static task => { _ = task.Exception; }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            throw;
         }
     }
 

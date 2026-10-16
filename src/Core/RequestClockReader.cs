@@ -31,6 +31,11 @@ public sealed class RequestClockReader
             using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
             { DataSource = database, Mode = SqliteOpenMode.ReadOnly, Pooling = false, DefaultTimeout = 1 }.ToString());
             connection.Open();
+            cancellationToken.ThrowIfCancellationRequested();
+            // SqliteCommand.Cancel is a no-op. Check cancellation inside SQLite's
+            // VM too, including queries which have not produced their first row.
+            SQLitePCL.raw.sqlite3_progress_handler(connection.Handle, 1000,
+                static state => ((CancellationToken)state).IsCancellationRequested ? 1 : 0, cancellationToken);
             using (var maximum = connection.CreateCommand())
             {
                 maximum.CommandText = "SELECT COALESCE(MAX(id),0) FROM logs";
@@ -57,8 +62,11 @@ public sealed class RequestClockReader
                 times.Add(reader.GetInt64(1) + reader.GetInt64(2) / 1e9);
             }
         }
+        catch (SqliteException) when (cancellationToken.IsCancellationRequested)
+        { throw new OperationCanceledException(cancellationToken); }
         catch (Exception e) when (e is SqliteException or IOException or UnauthorizedAccessException)
         { Warning = "请求诊断库不可用，仅使用输出项计时"; }
+        cancellationToken.ThrowIfCancellationRequested();
         return Freeze();
     }
     IReadOnlyDictionary<string, double[]> Freeze() => clocks.ToDictionary(p => p.Key, p => p.Value.Order().ToArray());
